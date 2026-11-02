@@ -8,12 +8,12 @@ pipeline {
         PREVIOUS_IMAGE = 'permix:previous'
         CONTAINER_NAME = 'permix-jenkins-test'
         HOST_PORT = '8083'
-        DEPLOYMENT_ATTEMPTED = 'false'
     }
 
     stages {
         stage('Checkout') {
             steps {
+                sh 'rm -f .deployment-attempted'
                 checkout scm
             }
         }
@@ -76,9 +76,8 @@ pipeline {
         stage('Deploy Application') {
             steps {
                 script {
-                    env.DEPLOYMENT_ATTEMPTED = 'true'
-
-                    echo "DEBUG: DEPLOYMENT_ATTEMPTED = ${env.DEPLOYMENT_ATTEMPTED}"
+                    writeFile file: '.deployment-attempted', text: 'true'
+                    echo 'DEBUG: Deployment marker created.'
                 }
 
                 sh '''
@@ -99,7 +98,7 @@ pipeline {
                     sleep 5
 
                     # Intentional failure for rollback testing.
-                    # Restore this URL to port 8083 after testing.
+                    # Change to ${HOST_PORT} after rollback is confirmed.
                     curl --fail http://host.docker.internal:8084
                 '''
             }
@@ -109,9 +108,7 @@ pipeline {
     post {
         failure {
             script {
-                echo "DEBUG: Post-failure DEPLOYMENT_ATTEMPTED = ${env.DEPLOYMENT_ATTEMPTED}"
-
-                if (env.DEPLOYMENT_ATTEMPTED == 'true') {
+                if (fileExists('.deployment-attempted')) {
                     echo 'Deployment failed. Starting rollback...'
 
                     sh '''
@@ -149,4 +146,3 @@ pipeline {
         }
     }
 }
-
