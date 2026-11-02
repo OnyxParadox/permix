@@ -99,7 +99,7 @@ pipeline {
 
                     # Intentional failure for rollback testing.
                     # Change to ${HOST_PORT} after rollback is confirmed.
-                    curl --fail http://host.docker.internal:8084
+                    curl --fail http://host.docker.internal:${HOST_PORT}
                 '''
             }
         }
