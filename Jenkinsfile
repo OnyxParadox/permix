@@ -5,6 +5,8 @@ pipeline {
     environment {
         APP_NAME = 'permix'
         DOCKER_IMAGE = 'permix:latest'
+        CONTAINER_NAME = 'permix-jenkins-test'
+        HOST_PORT = '8083'
     }
 
     stages {
@@ -55,7 +57,30 @@ pipeline {
                 sh 'docker build -t ${DOCKER_IMAGE} .'
             }
         }
+
+        stage('Deploy Application') {
+            steps {
+                sh '''
+                    docker stop ${CONTAINER_NAME} || true
+                    docker rm ${CONTAINER_NAME} || true
+
+                    docker run -d \
+                        --name ${CONTAINER_NAME} \
+                        -p ${HOST_PORT}:80 \
+                        ${DOCKER_IMAGE}
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    sleep 5
+
+                    curl --fail \
+                        http://localhost:${HOST_PORT}
+                '''
+            }
+        }
     }
 }
-
-
