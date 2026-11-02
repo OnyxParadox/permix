@@ -76,7 +76,7 @@ pipeline {
         stage('Deploy Application') {
             steps {
                 script {
-                    DEPLOYMENT_ATTEMPTED = 'true'
+                    env.DEPLOYMENT_ATTEMPTED = 'true'
                 }
 
                 sh '''
@@ -106,7 +106,7 @@ pipeline {
     post {
         failure {
             script {
-                if (DEPLOYMENT_ATTEMPTED == 'true') {
+                if (env.DEPLOYMENT_ATTEMPTED == 'true') {
                     echo 'Deployment failed. Starting rollback...'
 
                     sh '''
