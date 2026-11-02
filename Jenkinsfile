@@ -78,7 +78,7 @@ pipeline {
                     sleep 5
 
                     curl --fail \
-                        http://localhost:${HOST_PORT}
+                        http://host.docker.internal:${HOST_PORT}
                 '''
             }
         }
