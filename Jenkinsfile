@@ -96,8 +96,7 @@ pipeline {
                 sh '''
                     sleep 5
 
-                    curl --fail 
-                        http://host.docker.internal:8084
+                    curl --fail http://host.docker.internal:8084
                 '''
             }
         }
