@@ -22,7 +22,7 @@ pipeline {
                 }
             }
             steps {
-                sh 'npm ci || npm install'
+                sh 'npm ci'
             }
         }
 
