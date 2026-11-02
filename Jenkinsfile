@@ -77,6 +77,8 @@ pipeline {
             steps {
                 script {
                     env.DEPLOYMENT_ATTEMPTED = 'true'
+
+                    echo "DEBUG: DEPLOYMENT_ATTEMPTED = ${env.DEPLOYMENT_ATTEMPTED}"
                 }
 
                 sh '''
@@ -96,6 +98,8 @@ pipeline {
                 sh '''
                     sleep 5
 
+                    # Intentional failure for rollback testing.
+                    # Restore this URL to port 8083 after testing.
                     curl --fail http://host.docker.internal:8084
                 '''
             }
@@ -105,11 +109,15 @@ pipeline {
     post {
         failure {
             script {
+                echo "DEBUG: Post-failure DEPLOYMENT_ATTEMPTED = ${env.DEPLOYMENT_ATTEMPTED}"
+
                 if (env.DEPLOYMENT_ATTEMPTED == 'true') {
                     echo 'Deployment failed. Starting rollback...'
 
                     sh '''
                         if docker image inspect ${PREVIOUS_IMAGE} >/dev/null 2>&1; then
+                            echo "Previous image found. Starting rollback..."
+
                             docker stop ${CONTAINER_NAME} || true
                             docker rm ${CONTAINER_NAME} || true
 
@@ -141,3 +149,4 @@ pipeline {
         }
     }
 }
+
