@@ -67,11 +67,20 @@ pipeline {
             }
         }
 
+
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t ${DOCKER_IMAGE} .'
+                sh '''
+                    docker build \
+                        -t ${DOCKER_IMAGE} \
+                        -t ${APP_NAME}:build-${BUILD_NUMBER} \
+                        .
+
+                    echo "Built image: ${APP_NAME}:build-${BUILD_NUMBER}"
+                '''
             }
         }
+
 
         stage('Deploy Application') {
             steps {
@@ -97,8 +106,8 @@ pipeline {
                 sh '''
                     sleep 5
 
-                    # Intentional failure for rollback testing.
-                    # Change to ${HOST_PORT} after rollback is confirmed.
+                    # Verify that the newly deployed application is reachable.
+
                     curl --fail http://host.docker.internal:${HOST_PORT}
                 '''
             }
