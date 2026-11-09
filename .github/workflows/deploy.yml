@@ -1,0 +1,393 @@
+name: Permix CI/CD Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: permix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------
+  # JOB 1: LINT, TEST AND BUILD
+  # --------------------------------------------------
+  validate:
+    name: Lint, Test and Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+  # --------------------------------------------------
+  # JOB 2: BUILD IMAGE AND DEPLOY TO STAGING
+  # --------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    environment:
+      name: staging
+      url: http://${{ vars.ALB_DNS_NAME }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      TASK_DEFINITION_FAMILY: ${{ vars.TASK_DEFINITION_FAMILY }}
+      ALB_DNS_NAME: ${{ vars.ALB_DNS_NAME }}
+
+    outputs:
+      image_tag: ${{ steps.image.outputs.image_tag }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: Permix-Staging-Deploy
+          allowed-account-ids: "045510281119"
+          role-duration-seconds: 3600
+
+      - name: Verify deployment tools
+        run: |
+          aws --version
+          jq --version
+          docker --version
+          curl --version
+
+      - name: Build and push immutable staging image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity \
+            --query Account --output text)"
+
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_TAG="sha-${GITHUB_SHA}"
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "Image: $IMAGE_URI"
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login \
+                --username AWS \
+                --password-stdin "$REGISTRY"
+
+          image_exists() {
+            local repository="$1"
+            local tag="$2"
+            local found
+
+            found="$(aws ecr batch-get-image \
+              --repository-name "$repository" \
+              --image-ids imageTag="$tag" \
+              --query 'images[0].imageId.imageTag' \
+              --output text 2>/dev/null || true)"
+
+            [[ "$found" == "$tag" ]]
+          }
+
+          # ECR repositories use immutable tags.
+          # Reuse the image when this commit has already been pushed.
+          if image_exists "$ECR_REPOSITORY" "$IMAGE_TAG"; then
+            echo "Image already exists. Reusing immutable image."
+          else
+            docker build --pull -t "$IMAGE_URI" .
+            docker push "$IMAGE_URI"
+          fi
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Register new staging task definition
+        id: task-definition
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > "$RUNNER_TEMP/current-task-definition.json"
+
+          jq --arg image "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "permix" then .image = $image
+              else .
+              end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt
+              )
+          ' "$RUNNER_TEMP/current-task-definition.json" \
+            > "$RUNNER_TEMP/new-task-definition.json"
+
+          jq -e --arg image "$IMAGE_URI" '
+            any(.containerDefinitions[];
+              .name == "permix" and .image == $image
+            )
+          ' "$RUNNER_TEMP/new-task-definition.json" > /dev/null
+
+          TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+            --cli-input-json "file://$RUNNER_TEMP/new-task-definition.json" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+
+          echo "Registered: $TASK_DEFINITION_ARN"
+          echo "task_definition_arn=$TASK_DEFINITION_ARN" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Deploy staging with automatic rollback
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_TIMEOUT_SECONDS=300 \
+          ROLLBACK_TIMEOUT_SECONDS=300 \
+          ./scripts/deploy-ecs.sh "$TASK_DEFINITION_ARN"
+
+      - name: Verify staging application endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL="http://${ALB_DNS_NAME}/health"
+
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 10 "$HEALTH_URL" > /dev/null; then
+              echo "Staging HTTP health check passed."
+              exit 0
+            fi
+
+            echo "Attempt $attempt failed. Retrying..."
+            sleep 5
+          done
+
+          echo "ERROR: Staging HTTP health check failed."
+          exit 1
+
+  # --------------------------------------------------
+  # JOB 3: MANUAL APPROVAL AND PRODUCTION DEPLOYMENT
+  # --------------------------------------------------
+  deploy-production:
+    name: Approval and Deploy to Production
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    # GitHub pauses this job until the required reviewer approves.
+    environment:
+      name: production
+      url: http://${{ vars.ALB_DNS_NAME }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      TASK_DEFINITION_FAMILY: ${{ vars.TASK_DEFINITION_FAMILY }}
+      ALB_DNS_NAME: ${{ vars.ALB_DNS_NAME }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: Permix-Production-Deploy
+          allowed-account-ids: "045510281119"
+          role-duration-seconds: 3600
+
+      - name: Promote staging image to production ECR
+        id: image
+        env:
+          IMAGE_TAG: ${{ needs.deploy-staging.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity \
+            --query Account --output text)"
+
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          STAGING_REPOSITORY="infra-as-code-pipeline-staging-permix"
+
+          SOURCE_IMAGE="${REGISTRY}/${STAGING_REPOSITORY}:${IMAGE_TAG}"
+          TARGET_IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login \
+                --username AWS \
+                --password-stdin "$REGISTRY"
+
+          image_exists() {
+            local repository="$1"
+            local tag="$2"
+            local found
+
+            found="$(aws ecr batch-get-image \
+              --repository-name "$repository" \
+              --image-ids imageTag="$tag" \
+              --query 'images[0].imageId.imageTag' \
+              --output text 2>/dev/null || true)"
+
+            [[ "$found" == "$tag" ]]
+          }
+
+          # Reuse an existing immutable production image on workflow reruns.
+          if image_exists "$ECR_REPOSITORY" "$IMAGE_TAG"; then
+            echo "Production image already exists. Reusing it."
+          else
+            if ! image_exists "$STAGING_REPOSITORY" "$IMAGE_TAG"; then
+              echo "ERROR: Staging image $IMAGE_TAG was not found."
+              exit 1
+            fi
+
+            docker pull "$SOURCE_IMAGE"
+            docker tag "$SOURCE_IMAGE" "$TARGET_IMAGE"
+            docker push "$TARGET_IMAGE"
+          fi
+
+          echo "Production image: $TARGET_IMAGE"
+          echo "image_uri=$TARGET_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register new production task definition
+        id: task-definition
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > "$RUNNER_TEMP/current-task-definition.json"
+
+          jq --arg image "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "permix" then .image = $image
+              else .
+              end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt
+              )
+          ' "$RUNNER_TEMP/current-task-definition.json" \
+            > "$RUNNER_TEMP/new-task-definition.json"
+
+          jq -e --arg image "$IMAGE_URI" '
+            any(.containerDefinitions[];
+              .name == "permix" and .image == $image
+            )
+          ' "$RUNNER_TEMP/new-task-definition.json" > /dev/null
+
+          TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+            --cli-input-json "file://$RUNNER_TEMP/new-task-definition.json" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+
+          echo "Registered: $TASK_DEFINITION_ARN"
+          echo "task_definition_arn=$TASK_DEFINITION_ARN" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Deploy production with automatic rollback
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_TIMEOUT_SECONDS=300 \
+          ROLLBACK_TIMEOUT_SECONDS=300 \
+          ./scripts/deploy-ecs.sh "$TASK_DEFINITION_ARN"
+
+      - name: Verify production application endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL="http://${ALB_DNS_NAME}/health"
+
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 10 "$HEALTH_URL" > /dev/null; then
+              echo "Production HTTP health check passed."
+              exit 0
+            fi
+
+            echo "Attempt $attempt failed. Retrying..."
+            sleep 5
+          done
+
+          echo "ERROR: Production HTTP health check failed."
+          exit 1
