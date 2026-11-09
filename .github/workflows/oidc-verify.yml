@@ -1,0 +1,34 @@
+name: AWS OIDC Authentication Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-aws-oidc:
+    name: Verify AWS OIDC Authentication
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActions-OIDC-Test
+          allowed-account-ids: "045510281119"
+          role-duration-seconds: 900
+
+      - name: Verify AWS Identity
+        run: |
+          echo "========== AWS IDENTITY =========="
+          aws sts get-caller-identity
+
+          echo ""
+          echo "AWS OIDC authentication successful."
