@@ -161,9 +161,18 @@ export function parseSymbolicMode(value: string): {
   symbolic: string
 } {
   const trimmed = value.trim()
-  const digits = trimmed.replace(/^[-dcbpls]/, '')
 
-  if (!/^[r-][w-][xStsT-]{3}$/.test(digits) && !/^[r-][w-][xStsT-]{9}$/.test(trimmed)) {
+  // A file-type prefix is present only in a 10-character mode string.
+  const hasFileTypePrefix =
+    trimmed.length === 10 && /^[-dcbpls]/.test(trimmed)
+
+  const text = hasFileTypePrefix ? trimmed.slice(1) : trimmed
+
+  // Validate read, write and execute/special-bit positions separately.
+  const symbolicPattern =
+    /^[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]$/
+
+  if (!symbolicPattern.test(text)) {
     return {
       valid: false,
       permissions: defaultGroups,
@@ -172,24 +181,16 @@ export function parseSymbolicMode(value: string): {
     }
   }
 
-  const text = trimmed.startsWith('-') || trimmed.startsWith('d') || trimmed.startsWith('l') || trimmed.startsWith('c') || trimmed.startsWith('b') || trimmed.startsWith('p') || trimmed.startsWith('s')
-    ? trimmed.slice(1)
-    : trimmed
-
   const owner = text.slice(0, 3)
   const group = text.slice(3, 6)
   const others = text.slice(6, 9)
 
-  const ownerPerms = parseSymbolChunk(owner)
-  const groupPerms = parseSymbolChunk(group)
-  const othersPerms = parseSymbolChunk(others)
-
   return {
     valid: true,
     permissions: {
-      owner: ownerPerms,
-      group: groupPerms,
-      others: othersPerms,
+      owner: parseSymbolChunk(owner),
+      group: parseSymbolChunk(group),
+      others: parseSymbolChunk(others),
     },
     special: {
       setuid: owner.includes('s') || owner.includes('S'),
@@ -203,7 +204,10 @@ export function parseSymbolicMode(value: string): {
 export function parseSymbolChunk(chunk: string): PermissionBits {
   const read = chunk[0] === 'r'
   const write = chunk[1] === 'w'
-  const execute = chunk[2] === 'x' || chunk[2] === 's' || chunk[2] === 'S' || chunk[2] === 't' || chunk[2] === 'T'
+
+  // Uppercase S/T indicate special bits without execute permission.
+  const execute =
+    chunk[2] === 'x' || chunk[2] === 's' || chunk[2] === 't'
 
   return { read, write, execute }
 }
